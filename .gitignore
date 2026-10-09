@@ -1,0 +1,29 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.out
+coverage.html
+
+# Databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local config
+.env
+config.env
+.gophkeeper/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+
+dist/
