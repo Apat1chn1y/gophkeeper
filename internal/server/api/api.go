@@ -140,7 +140,16 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	items, err := s.svc.ListItems(r.Context(), userID(r))
+	q := r.URL.Query().Get("q")
+	var (
+		items []protocol.ItemDTO
+		err   error
+	)
+	if q != "" {
+		items, err = s.svc.SearchItems(r.Context(), userID(r), q)
+	} else {
+		items, err = s.svc.ListItems(r.Context(), userID(r))
+	}
 	if err != nil {
 		s.writeServiceError(w, err)
 		return

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"gophkeeper/internal/models"
 	"gophkeeper/internal/protocol"
 )
 
@@ -34,6 +35,18 @@ func isolatePaths(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("GOPHKEEPER_CLIENT_CONFIG", filepath.Join(dir, "config.json"))
 	t.Setenv("GOPHKEEPER_CLIENT_DB", filepath.Join(dir, "client.db"))
+}
+
+func seedConfig(t *testing.T) (dir, cfgPath string) {
+	t.Helper()
+	dir = t.TempDir()
+	cfgPath = filepath.Join(dir, "cfg.json")
+	t.Setenv("GOPHKEEPER_CLIENT_CONFIG", cfgPath)
+	t.Setenv("GOPHKEEPER_CLIENT_DB", filepath.Join(dir, "client.db"))
+	if err := writeConfig(cfgPath, "http://example.invalid", "tok", "u1"); err != nil {
+		t.Fatalf("seed cfg: %v", err)
+	}
+	return dir, cfgPath
 }
 
 func TestVersion(t *testing.T) {
@@ -64,14 +77,17 @@ func TestUnknownCommand(t *testing.T) {
 	}
 }
 
+// TestRegisterAndLogout drives register with server/username/email as
+// flags and the password on stdin (the -password flag was removed on
+// purpose: it would leak through the process listing).
 func TestRegisterAndLogout(t *testing.T) {
 	isolatePaths(t)
 	srv := fakeAuthServer(t)
 
 	var out bytes.Buffer
 	err := Run(context.Background(),
-		[]string{"register", "-server", srv.URL, "-username", "alice", "-email", "a@x.io", "-password", "pw"},
-		strings.NewReader(""), &out, &out)
+		[]string{"register", "-server", srv.URL, "-username", "alice", "-email", "a@x.io"},
+		strings.NewReader("pw\n"), &out, &out)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -88,17 +104,40 @@ func TestRegisterAndLogout(t *testing.T) {
 	}
 }
 
+// TestRegisterAllPrompts feeds server, username, email and password on
+// stdin so that no flags are needed.
+func TestRegisterAllPrompts(t *testing.T) {
+	isolatePaths(t)
+	srv := fakeAuthServer(t)
+
+	var out bytes.Buffer
+	err := Run(context.Background(),
+		[]string{"register"},
+		strings.NewReader(srv.URL+"\nalice\na@x.io\npw\n"), &out, &out)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if !strings.Contains(out.String(), "Registered and logged in") {
+		t.Fatalf("unexpected: %s", out.String())
+	}
+}
+
+func TestRegisterNoPasswordOnStdin(t *testing.T) {
+	isolatePaths(t)
+	srv := fakeAuthServer(t)
+
+	var out bytes.Buffer
+	err := Run(context.Background(),
+		[]string{"register", "-server", srv.URL, "-username", "alice", "-email", "a@x.io"},
+		strings.NewReader(""), &out, &out)
+	if err == nil {
+		t.Fatal("expected error when no password is provided")
+	}
+}
+
 func TestAddAndListAndGet(t *testing.T) {
 	isolatePaths(t)
-
-	// Pre-seed a config so add/list/get find a server address.
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "cfg.json")
-	t.Setenv("GOPHKEEPER_CLIENT_CONFIG", cfgPath)
-	t.Setenv("GOPHKEEPER_CLIENT_DB", filepath.Join(dir, "client.db"))
-	if err := writeConfig(cfgPath, "http://example.invalid", "tok", "u1"); err != nil {
-		t.Fatalf("seed cfg: %v", err)
-	}
+	seedConfig(t)
 
 	// add text item: prompts are Title, Metadata, Data.
 	in := strings.NewReader("my note\ntag1\nsecret body\n")
@@ -110,7 +149,6 @@ func TestAddAndListAndGet(t *testing.T) {
 		t.Fatalf("unexpected: %s", out.String())
 	}
 
-	// list: should show exactly one item.
 	out.Reset()
 	if err := Run(context.Background(), []string{"list"}, strings.NewReader(""), &out, &out); err != nil {
 		t.Fatalf("list: %v", err)
@@ -138,22 +176,21 @@ func TestLoginAfterRegister(t *testing.T) {
 	isolatePaths(t)
 	srv := fakeAuthServer(t)
 
-	// Register first.
+	// Register first (password on stdin).
 	var out bytes.Buffer
 	_ = Run(context.Background(),
-		[]string{"register", "-server", srv.URL, "-username", "bob",
-			"-email", "b@x.io", "-password", "pw"},
-		strings.NewReader(""), &out, &out)
+		[]string{"register", "-server", srv.URL, "-username", "bob", "-email", "b@x.io"},
+		strings.NewReader("pw\n"), &out, &out)
 
 	// Logout.
 	out.Reset()
 	_ = Run(context.Background(), []string{"logout"}, strings.NewReader(""), &out, &out)
 
-	// Login again with explicit flags.
+	// Login again (password on stdin).
 	out.Reset()
 	if err := Run(context.Background(),
-		[]string{"login", "-server", srv.URL, "-username", "bob", "-password", "pw"},
-		strings.NewReader(""), &out, &out); err != nil {
+		[]string{"login", "-server", srv.URL, "-username", "bob"},
+		strings.NewReader("pw\n"), &out, &out); err != nil {
 		t.Fatalf("login: %v", err)
 	}
 	if !strings.Contains(out.String(), "Logged in as bob") {
@@ -173,8 +210,8 @@ func TestLoginWrongPassword(t *testing.T) {
 
 	var out bytes.Buffer
 	err := Run(context.Background(),
-		[]string{"login", "-server", srv.URL, "-username", "x", "-password", "y"},
-		strings.NewReader(""), &out, &out)
+		[]string{"login", "-server", srv.URL, "-username", "x"},
+		strings.NewReader("y\n"), &out, &out)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -182,13 +219,8 @@ func TestLoginWrongPassword(t *testing.T) {
 
 func TestGetAfterAdd(t *testing.T) {
 	isolatePaths(t)
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "cfg.json")
-	t.Setenv("GOPHKEEPER_CLIENT_CONFIG", cfgPath)
-	t.Setenv("GOPHKEEPER_CLIENT_DB", filepath.Join(dir, "client.db"))
-	_ = writeConfig(cfgPath, "http://example.invalid", "tok", "u1")
+	seedConfig(t)
 
-	// Add an item, capture its ID from stdout.
 	var out bytes.Buffer
 	if err := Run(context.Background(), []string{"add", "text"},
 		strings.NewReader("my note\n\nbody\n"), &out, &out); err != nil {
@@ -199,7 +231,6 @@ func TestGetAfterAdd(t *testing.T) {
 		t.Fatalf("could not parse id from %q", out.String())
 	}
 
-	// Get it back.
 	out.Reset()
 	if err := Run(context.Background(), []string{"get", id},
 		strings.NewReader(""), &out, &out); err != nil {
@@ -209,7 +240,6 @@ func TestGetAfterAdd(t *testing.T) {
 		t.Fatalf("get missing content: %s", out.String())
 	}
 
-	// Delete it.
 	out.Reset()
 	if err := Run(context.Background(), []string{"delete", id},
 		strings.NewReader(""), &out, &out); err != nil {
@@ -219,7 +249,6 @@ func TestGetAfterAdd(t *testing.T) {
 		t.Fatalf("delete: %s", out.String())
 	}
 
-	// List no longer shows it.
 	out.Reset()
 	_ = Run(context.Background(), []string{"list"}, strings.NewReader(""), &out, &out)
 	if strings.Contains(out.String(), "my note") {
@@ -242,7 +271,6 @@ func lastID(s string) string {
 func TestTUIWithoutLogin(t *testing.T) {
 	isolatePaths(t)
 	var out bytes.Buffer
-	// openEnv fails because no server address is set.
 	err := Run(context.Background(), []string{"tui"}, strings.NewReader(""), &out, &out)
 	if err == nil {
 		t.Fatal("expected error without configured server")
@@ -251,11 +279,9 @@ func TestTUIWithoutLogin(t *testing.T) {
 
 func TestTUIWithoutToken(t *testing.T) {
 	isolatePaths(t)
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "cfg.json")
-	t.Setenv("GOPHKEEPER_CLIENT_CONFIG", cfgPath)
-	t.Setenv("GOPHKEEPER_CLIENT_DB", filepath.Join(dir, "client.db"))
-	// Config exists but has no token.
+	seedConfig(t)
+	// Overwrite with no token.
+	cfgPath := os.Getenv("GOPHKEEPER_CLIENT_CONFIG")
 	_ = writeConfig(cfgPath, "http://example.invalid", "", "")
 
 	var out bytes.Buffer
@@ -267,14 +293,8 @@ func TestTUIWithoutToken(t *testing.T) {
 
 func TestAddBinaryFromFile(t *testing.T) {
 	isolatePaths(t)
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "cfg.json")
-	t.Setenv("GOPHKEEPER_CLIENT_CONFIG", cfgPath)
-	t.Setenv("GOPHKEEPER_CLIENT_DB", filepath.Join(dir, "client.db"))
-	_ = writeConfig(cfgPath, "http://example.invalid", "tok", "u1")
+	dir, _ := seedConfig(t)
 
-	// Prepare a binary file with null bytes — this is exactly what the
-	// interactive path cannot handle.
 	binPath := filepath.Join(dir, "blob.bin")
 	want := []byte{0x00, 0x01, 0xff, 0x42, 0x00}
 	if err := os.WriteFile(binPath, want, 0o600); err != nil {
@@ -295,11 +315,7 @@ func TestAddBinaryFromFile(t *testing.T) {
 
 func TestAddBinaryRequiresFromFile(t *testing.T) {
 	isolatePaths(t)
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "cfg.json")
-	t.Setenv("GOPHKEEPER_CLIENT_CONFIG", cfgPath)
-	t.Setenv("GOPHKEEPER_CLIENT_DB", filepath.Join(dir, "client.db"))
-	_ = writeConfig(cfgPath, "http://example.invalid", "tok", "u1")
+	seedConfig(t)
 
 	var out bytes.Buffer
 	err := Run(context.Background(),
@@ -307,5 +323,117 @@ func TestAddBinaryRequiresFromFile(t *testing.T) {
 		strings.NewReader(""), &out, &out)
 	if err == nil {
 		t.Fatal("expected error for binary without -from-file")
+	}
+}
+
+// TestAddFromFileTooBig verifies that a file larger than maxUploadBytes
+// is rejected with a clear message before os.ReadFile is called.
+func TestAddFromFileTooBig(t *testing.T) {
+	isolatePaths(t)
+	dir, _ := seedConfig(t)
+
+	bigPath := filepath.Join(dir, "big.bin")
+	f, err := os.Create(bigPath)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// 800 KiB > 700 KiB cap.
+	if _, err := f.Write(make([]byte, 800*1024)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = f.Close()
+
+	var out bytes.Buffer
+	err = Run(context.Background(),
+		[]string{"add", "binary", "-from-file", bigPath, "-title", "big"},
+		strings.NewReader(""), &out, &out)
+	if err == nil {
+		t.Fatal("expected error for oversized file")
+	}
+	if !strings.Contains(err.Error(), "limit is") {
+		t.Fatalf("error should explain the limit: %v", err)
+	}
+}
+
+func TestAddFromFileMissing(t *testing.T) {
+	isolatePaths(t)
+	seedConfig(t)
+	var out bytes.Buffer
+	err := Run(context.Background(),
+		[]string{"add", "binary", "-from-file", "/nonexistent/path"},
+		strings.NewReader(""), &out, &out)
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+// TestListSearchQueriesServer verifies that -search hits GET /api/v1/items?q=...
+func TestListSearchQueriesServer(t *testing.T) {
+	isolatePaths(t)
+	dir, _ := seedConfig(t)
+	_ = dir
+
+	// Stand up a fake server that answers the search endpoint.
+	seenQuery := make(chan string, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/items", func(w http.ResponseWriter, r *http.Request) {
+		seenQuery <- r.URL.Query().Get("q")
+		_ = json.NewEncoder(w).Encode(protocol.PushResponse{
+			Items: []protocol.ItemDTO{
+				{ID: "s1", Type: "text", Title: "found", Metadata: "github"},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	// Repoint config at the fake server but keep the token.
+	cfgPath := os.Getenv("GOPHKEEPER_CLIENT_CONFIG")
+	_ = writeConfig(cfgPath, srv.URL, "tok", "u1")
+
+	var out bytes.Buffer
+	if err := Run(context.Background(),
+		[]string{"list", "-search", "github"},
+		strings.NewReader(""), &out, &out); err != nil {
+		t.Fatalf("list -search: %v", err)
+	}
+	if got := <-seenQuery; got != "github" {
+		t.Fatalf("server got q=%q, want github", got)
+	}
+	if !strings.Contains(out.String(), "found") {
+		t.Fatalf("search results not printed: %s", out.String())
+	}
+}
+
+func TestListSearchRequiresLogin(t *testing.T) {
+	isolatePaths(t)
+	seedConfig(t)
+	cfgPath := os.Getenv("GOPHKEEPER_CLIENT_CONFIG")
+	_ = writeConfig(cfgPath, "http://example.invalid", "", "")
+
+	var out bytes.Buffer
+	err := Run(context.Background(),
+		[]string{"list", "-search", "x"},
+		strings.NewReader(""), &out, &out)
+	if err == nil {
+		t.Fatal("expected error without token")
+	}
+}
+
+// TestPrintItemBinaryHidesData guards the binary-print behaviour:
+// binary payloads must not be dumped to the terminal.
+func TestPrintItemBinaryHidesData(t *testing.T) {
+	var buf bytes.Buffer
+	it := &models.Item{
+		ID: "b1", Type: models.ItemTypeBinary, Title: "blob",
+		Data: []byte{0x00, 0x01, 0xff, 'a', 'b'},
+	}
+	printItem(&buf, it)
+	got := buf.String()
+	if strings.Contains(got, "\x00") || strings.Contains(got, "\xff") {
+		t.Fatalf("binary bytes leaked into output: %q", got)
+	}
+	if !strings.Contains(got, "5 bytes") {
+		t.Fatalf("expected byte count: %q", got)
 	}
 }

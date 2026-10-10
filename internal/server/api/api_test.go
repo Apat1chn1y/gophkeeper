@@ -226,3 +226,60 @@ func TestBadJSONReturns400(t *testing.T) {
 		t.Fatalf("want 400, got %d", resp.StatusCode)
 	}
 }
+
+func TestSearchEndpointFiltersByQuery(t *testing.T) {
+	srv := newTestServer(t)
+	tok := registerAndLogin(t, srv)
+	now := time.Now().UTC()
+
+	_, _ = doJSON(t, http.MethodPost, srv.URL+"/api/v1/sync/push", tok, protocol.PushRequest{
+		Items: []protocol.ItemDTO{
+			{ID: "i1", Type: "text", Title: "gh",
+				Metadata: "github", Data: []byte("x"), UpdatedAt: now},
+			{ID: "i2", Type: "text", Title: "other",
+				Metadata: "example", Data: []byte("y"), UpdatedAt: now},
+		},
+	})
+
+	resp, body := doJSON(t, http.MethodGet, srv.URL+"/api/v1/items?q=github", tok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("search status %d: %s", resp.StatusCode, body)
+	}
+	var got protocol.PushResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Items) != 1 || got.Items[0].ID != "i1" {
+		t.Fatalf("unexpected: %+v", got.Items)
+	}
+}
+
+func TestSearchEndpointRequiresAuth(t *testing.T) {
+	srv := newTestServer(t)
+	resp, _ := doJSON(t, http.MethodGet, srv.URL+"/api/v1/items?q=x", "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestSearchEmptyQueryReturnsAll(t *testing.T) {
+	srv := newTestServer(t)
+	tok := registerAndLogin(t, srv)
+	now := time.Now().UTC()
+	_, _ = doJSON(t, http.MethodPost, srv.URL+"/api/v1/sync/push", tok, protocol.PushRequest{
+		Items: []protocol.ItemDTO{
+			{ID: "i1", Type: "text", Title: "a", UpdatedAt: now},
+			{ID: "i2", Type: "text", Title: "b", UpdatedAt: now},
+		},
+	})
+
+	resp, body := doJSON(t, http.MethodGet, srv.URL+"/api/v1/items?q=", tok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var got protocol.PushResponse
+	_ = json.Unmarshal(body, &got)
+	if len(got.Items) != 2 {
+		t.Fatalf("empty q should return all items, got %+v", got.Items)
+	}
+}

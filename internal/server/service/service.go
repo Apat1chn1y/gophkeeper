@@ -179,6 +179,27 @@ func (s *Service) ListItems(ctx context.Context, userID string) ([]protocol.Item
 	return out, nil
 }
 
+// SearchItems returns non-deleted items of userID whose metadata
+// contains the given substring.
+func (s *Service) SearchItems(ctx context.Context, userID, query string) ([]protocol.ItemDTO, error) {
+	if query == "" {
+		return s.ListItems(ctx, userID)
+	}
+	items, err := s.repo.SearchItems(ctx, userID, query)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]protocol.ItemDTO, 0, len(items))
+	for i := range items {
+		dto, err := s.toDTO(&items[i])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, dto)
+	}
+	return out, nil
+}
+
 // GetItem returns a single item owned by userID.
 func (s *Service) GetItem(ctx context.Context, userID, itemID string) (*protocol.ItemDTO, error) {
 	m, err := s.repo.GetItem(ctx, userID, itemID)

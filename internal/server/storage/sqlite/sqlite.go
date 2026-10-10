@@ -20,22 +20,22 @@ import (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
-    id            TEXT PRIMARY KEY,
-    username      TEXT NOT NULL UNIQUE,
-    email         TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    created_at    INTEGER NOT NULL
+    id            TEXT         PRIMARY KEY,
+    username      VARCHAR(64)  NOT NULL UNIQUE,
+    email         VARCHAR(254) NOT NULL,
+    password_hash VARCHAR(72)  NOT NULL,
+    created_at    INTEGER      NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS items (
-    id         TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    type       TEXT NOT NULL,
-    title      TEXT NOT NULL,
-    data       BLOB NOT NULL,
-    metadata   TEXT NOT NULL DEFAULT '',
-    version    INTEGER NOT NULL DEFAULT 1,
-    updated_at INTEGER NOT NULL,
+    id         TEXT          PRIMARY KEY,
+    user_id    TEXT          NOT NULL,
+    type       VARCHAR(16)   NOT NULL,
+    title      VARCHAR(255)  NOT NULL,
+    data       BLOB          NOT NULL,
+    metadata   VARCHAR(1024) NOT NULL DEFAULT '',
+    version    INTEGER       NOT NULL DEFAULT 1,
+    updated_at INTEGER       NOT NULL,
     deleted_at INTEGER,
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
@@ -54,16 +54,18 @@ type Store struct {
 //
 // The special DSN ":memory:" creates a private in-memory database, which
 // is primarily useful for tests.
+//
+// The underlying connection pool is capped at one connection for both
+// in-memory and file-backed databases: SQLite's default DEFERRED
+// transactions can race on the same row across concurrent connections
+// and surface as SQLITE_BUSY, which is not a useful outcome for the
+// caller. A single connection serializes all access at the pool level.
 func Open(dsn string) (*Store, error) {
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
 	}
-	if strings.Contains(dsn, ":memory:") {
-		// An in-memory DB lives inside a single connection; the pool
-		// must not open additional connections.
-		db.SetMaxOpenConns(1)
-	}
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite: apply schema: %w", err)
@@ -75,24 +77,38 @@ func Open(dsn string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 // CreateUser implements storage.Repository.
+//
+// The INSERT is attempted directly; a uniqueness violation is translated
+// into storage.ErrDuplicate. There is no pre-flight SELECT — a concurrent
+// caller could win the race between the SELECT and the INSERT, and the
+// resulting error would not be recognizable as a duplicate. The schema's
+// UNIQUE constraint is the single source of truth.
 func (s *Store) CreateUser(ctx context.Context, u *models.User) error {
-	var exists int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM users WHERE username = ?`, u.Username).Scan(&exists)
-	if err == nil {
-		return storage.ErrDuplicate
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("sqlite: check username: %w", err)
-	}
-	_, err = s.db.ExecContext(ctx,
+	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO users(id, username, email, password_hash, created_at)
 		 VALUES(?, ?, ?, ?, ?)`,
 		u.ID, u.Username, u.Email, u.PasswordHash, u.CreatedAt.UnixNano())
 	if err != nil {
+		if isUniqueViolation(err) {
+			return storage.ErrDuplicate
+		}
 		return fmt.Errorf("sqlite: insert user: %w", err)
 	}
 	return nil
+}
+
+// isUniqueViolation reports whether err is a SQLite UNIQUE-constraint
+// violation. It prefers the structured error code exposed by the driver
+// and falls back to the driver's message text for robustness.
+func isUniqueViolation(err error) bool {
+	const sqliteConstraint = 19 // SQLITE_CONSTRAINT
+	var coder interface{ Code() int }
+	if errors.As(err, &coder) {
+		if coder.Code()&0xff == sqliteConstraint {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 // GetUserByUsername implements storage.Repository.
@@ -135,7 +151,6 @@ func (s *Store) UpsertItem(ctx context.Context, it *models.Item) (*models.Item, 
 		Scan(&curVersion, &curUpdated)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		// Insert new item.
 		it.Version = 1
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO items(id, user_id, type, title, data, metadata,
@@ -149,10 +164,8 @@ func (s *Store) UpsertItem(ctx context.Context, it *models.Item) (*models.Item, 
 	case err != nil:
 		return nil, fmt.Errorf("sqlite: lookup item: %w", err)
 	default:
-		// Existing: apply last-write-wins.
 		storedUpdated := time.Unix(0, curUpdated).UTC()
 		if !it.UpdatedAt.After(storedUpdated) {
-			// Server's copy is at least as fresh; return it as canonical.
 			_ = tx.Rollback()
 			return s.GetItem(ctx, it.UserID, it.ID)
 		}
@@ -202,6 +215,34 @@ func (s *Store) ListItems(ctx context.Context, userID string) ([]models.Item, er
 	}
 	defer rows.Close()
 	return collectItems(rows)
+}
+
+// SearchItems implements storage.Repository.
+//
+// The query is matched as a substring of the metadata column using
+// SQLite's LIKE (which is case-insensitive for ASCII). Wildcards in the
+// user-supplied string are treated as literals via ESCAPE.
+func (s *Store) SearchItems(ctx context.Context, userID, query string) ([]models.Item, error) {
+	pattern := "%" + escapeLike(query) + "%"
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, user_id, type, title, data, metadata,
+		        version, updated_at, deleted_at
+		 FROM items
+		 WHERE user_id = ? AND deleted_at IS NULL
+		   AND metadata LIKE ? ESCAPE '\'
+		 ORDER BY updated_at DESC`, userID, pattern)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: search items: %w", err)
+	}
+	defer rows.Close()
+	return collectItems(rows)
+}
+
+// escapeLike escapes the special characters %, _ and \ in s so that
+// they are matched literally by a LIKE ... ESCAPE '\' query.
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 // ItemsSince implements storage.Repository.

@@ -20,7 +20,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	// Register the pure-Go "sqlite" driver with database/sql. The import
@@ -64,9 +63,12 @@ func Open(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("localstore: open: %w", err)
 	}
-	if strings.Contains(dsn, ":memory:") {
-		db.SetMaxOpenConns(1)
-	}
+	// Serialize all access through a single connection. Without this,
+	// SQLite's default DEFERRED transactions can race on the same row
+	// and surface as SQLITE_BUSY — see modernc.org/sqlite docs on
+	// connection pool sizing. A single connection also matches how a
+	// CLI uses the store (one process, sequential commands).
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("localstore: apply schema: %w", err)
@@ -130,7 +132,7 @@ func (s *Store) ListItems(ctx context.Context) ([]models.Item, error) {
 		return nil, fmt.Errorf("localstore: list: %w", err)
 	}
 	defer rows.Close()
-	return collect(rows, false)
+	return collect(rows)
 }
 
 // ListDirty returns every dirty item, deleted ones included, in
@@ -145,7 +147,7 @@ func (s *Store) ListDirty(ctx context.Context) ([]models.Item, error) {
 		return nil, fmt.Errorf("localstore: list dirty: %w", err)
 	}
 	defer rows.Close()
-	return collect(rows, true)
+	return collect(rows)
 }
 
 // MarkClean replaces the local copy of an item with the server's
@@ -213,7 +215,8 @@ func scanItem(row interface{ Scan(...any) error }) (*models.Item, bool, error) {
 	return &it, dirty == 1, nil
 }
 
-func collect(rows *sql.Rows, _ bool) ([]models.Item, error) {
+// collect drains rows into a slice of models.Item.
+func collect(rows *sql.Rows) ([]models.Item, error) {
 	var out []models.Item
 	for rows.Next() {
 		it, _, err := scanItem(rows)

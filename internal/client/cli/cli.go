@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/term"
 
 	"gophkeeper/internal/client/api"
 	"gophkeeper/internal/client/config"
@@ -34,6 +35,12 @@ var (
 	// BuildDate is the build timestamp.
 	BuildDate = "unknown"
 )
+
+// maxUploadBytes caps the size of a file passed to `add -from-file`. The
+// server caps request bodies at 1 MiB, and base64-encoding plus the JSON
+// envelope inflate the payload by roughly 33%, so 700 KiB is a safe
+// ceiling that keeps the whole request under the server's limit.
+const maxUploadBytes = 700 * 1024
 
 // Run executes the client with the given arguments. args[0] is the
 // subcommand name, args[1:] its arguments.
@@ -95,18 +102,22 @@ Usage:
   client <command> [flags]
 
 Commands:
-  register         Register a new account
-  login            Authenticate and store a session token
+  register         Register a new account (password is prompted)
+  login            Authenticate and store a session token (password is prompted)
   logout           Forget the local session token
   sync             Exchange local and remote changes with the server
   add <type>       Add a new item (credentials|text|binary|card).
                    Flags: -title, -metadata, -from-file <path>
-  list [type]      List stored items, optionally filtered by type
+  list [type]      List stored items, optionally filtered by type.
+                   Flags: -search <substring> (queries the server)
   get <id>         Show a single item by ID
   delete <id>      Soft-delete an item
   version          Print version information
   help             Show this message
   tui              Start the interactive terminal UI
+
+Passwords are never accepted on the command line: they would be visible
+in the process listing and in the shell history.
 `)
 }
 
@@ -169,17 +180,16 @@ func openStore() (*localstore.Store, error) {
 func runRegister(ctx context.Context, args []string, in io.Reader, out io.Writer) error {
 	fs := flag.NewFlagSet("register", flag.ContinueOnError)
 	fs.SetOutput(out)
-	server := fs.String("server", "", "server base URL, e.g. http://localhost:8080")
+	server := fs.String("server", "", "server base URL, e.g. https://localhost:8080")
 	username := fs.String("username", "", "username")
 	email := fs.String("email", "", "email")
-	password := fs.String("password", "", "password (leave empty to be prompted)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	sc := bufio.NewScanner(in)
 	if *server == "" {
-		*server = prompt(sc, out, "Server URL", "http://localhost:8080")
+		*server = prompt(sc, out, "Server URL", "https://localhost:8080")
 	}
 	if *username == "" {
 		*username = prompt(sc, out, "Username", "")
@@ -187,17 +197,18 @@ func runRegister(ctx context.Context, args []string, in io.Reader, out io.Writer
 	if *email == "" {
 		*email = prompt(sc, out, "Email", "")
 	}
-	if *password == "" {
-		*password = prompt(sc, out, "Password", "")
+	password, err := readPassword(sc, in, out, "Password")
+	if err != nil {
+		return err
 	}
 
 	cfg := &config.Config{ServerAddress: *server}
 	client := api.New(*server, nil)
-	if _, err := client.Register(ctx, *username, *email, *password); err != nil {
+	if _, err := client.Register(ctx, *username, *email, password); err != nil {
 		return err
 	}
 	// Auto-login for convenience.
-	token, uid, err := client.Login(ctx, *username, *password)
+	token, uid, err := client.Login(ctx, *username, password)
 	if err != nil {
 		return fmt.Errorf("client: register succeeded but login failed: %w", err)
 	}
@@ -214,7 +225,6 @@ func runLogin(ctx context.Context, args []string, in io.Reader, out io.Writer) e
 	fs.SetOutput(out)
 	server := fs.String("server", "", "server base URL (defaults to saved value)")
 	username := fs.String("username", "", "username")
-	password := fs.String("password", "", "password (leave empty to be prompted)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -226,20 +236,20 @@ func runLogin(ctx context.Context, args []string, in io.Reader, out io.Writer) e
 	if *server != "" {
 		cfg.ServerAddress = *server
 	}
-	if cfg.ServerAddress == "" {
-		cfg.ServerAddress = prompt(bufio.NewScanner(in), out, "Server URL", "http://localhost:8080")
-	}
-
 	sc := bufio.NewScanner(in)
+	if cfg.ServerAddress == "" {
+		cfg.ServerAddress = prompt(sc, out, "Server URL", "https://localhost:8080")
+	}
 	if *username == "" {
 		*username = prompt(sc, out, "Username", "")
 	}
-	if *password == "" {
-		*password = prompt(sc, out, "Password", "")
+	password, err := readPassword(sc, in, out, "Password")
+	if err != nil {
+		return err
 	}
 
 	client := api.New(cfg.ServerAddress, nil)
-	token, uid, err := client.Login(ctx, *username, *password)
+	token, uid, err := client.Login(ctx, *username, password)
 	if err != nil {
 		return err
 	}
@@ -309,6 +319,17 @@ func runAdd(ctx context.Context, args []string, in io.Reader, out io.Writer) err
 	var body []byte
 	switch {
 	case *fileFlag != "":
+		fi, err := os.Stat(*fileFlag)
+		if err != nil {
+			return fmt.Errorf("client: stat %s: %w", *fileFlag, err)
+		}
+		if fi.Size() > maxUploadBytes {
+			return fmt.Errorf(
+				"client: %s is %d bytes, limit is %d bytes "+
+					"(base64 and JSON inflate the request, and the server "+
+					"caps request bodies at 1 MiB)",
+				*fileFlag, fi.Size(), maxUploadBytes)
+		}
 		body, err = os.ReadFile(*fileFlag)
 		if err != nil {
 			return fmt.Errorf("client: read %s: %w", *fileFlag, err)
@@ -347,23 +368,57 @@ func runAdd(ctx context.Context, args []string, in io.Reader, out io.Writer) err
 }
 
 func runList(ctx context.Context, args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	fs.SetOutput(out)
+	searchFlag := fs.String("search", "",
+		"search items by metadata substring (queries the server)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	var filter models.ItemType
+	if rest := fs.Args(); len(rest) > 0 {
+		filter = models.ItemType(rest[0])
+		if !filter.Valid() {
+			return fmt.Errorf("unknown item type %q", rest[0])
+		}
+	}
+
 	e, err := openEnv()
 	if err != nil {
 		return err
 	}
 	defer e.close()
 
-	var filter models.ItemType
-	if len(args) > 0 {
-		filter = models.ItemType(args[0])
-		if !filter.Valid() {
-			return fmt.Errorf("unknown item type %q", args[0])
+	var items []models.Item
+	if *searchFlag != "" {
+		if err := e.requireAuth(); err != nil {
+			return err
+		}
+		dtos, err := e.api.Search(ctx, e.cfg.Token, *searchFlag)
+		if err != nil {
+			return err
+		}
+		items = make([]models.Item, 0, len(dtos))
+		for _, d := range dtos {
+			items = append(items, models.Item{
+				ID:        d.ID,
+				Type:      models.ItemType(d.Type),
+				Title:     d.Title,
+				Data:      d.Data,
+				Metadata:  d.Metadata,
+				Version:   d.Version,
+				UpdatedAt: d.UpdatedAt,
+				DeletedAt: d.DeletedAt,
+			})
+		}
+	} else {
+		items, err = e.store.ListItems(ctx)
+		if err != nil {
+			return err
 		}
 	}
-	items, err := e.store.ListItems(ctx)
-	if err != nil {
-		return err
-	}
+
 	n := 0
 	for i := range items {
 		if filter != "" && items[i].Type != filter {
@@ -421,6 +476,10 @@ func runDelete(ctx context.Context, args []string, out io.Writer) error {
 	return nil
 }
 
+// printItem renders a single item to w.
+//
+// Binary payloads are summarized by length only — dumping raw bytes to a
+// terminal produces garbage and can flood the screen for large files.
 func printItem(w io.Writer, it *models.Item) {
 	status := "live"
 	if it.DeletedAt != nil {
@@ -431,11 +490,18 @@ func printItem(w io.Writer, it *models.Item) {
 	if len(it.Metadata) > 0 {
 		fmt.Fprintf(w, "  metadata: %s\n", it.Metadata)
 	}
-	if len(it.Data) > 0 {
-		fmt.Fprintf(w, "  data: %s\n", string(it.Data))
+	if len(it.Data) == 0 {
+		return
 	}
+	if it.Type == models.ItemTypeBinary {
+		fmt.Fprintf(w, "  data: %d bytes (binary, use sync to retrieve)\n", len(it.Data))
+		return
+	}
+	fmt.Fprintf(w, "  data: %s\n", string(it.Data))
 }
 
+// prompt prints a label, reads one line from sc, and returns it. An empty
+// line yields def.
 func prompt(sc *bufio.Scanner, out io.Writer, label, def string) string {
 	if def != "" {
 		fmt.Fprintf(out, "%s [%s]: ", label, def)
@@ -450,4 +516,29 @@ func prompt(sc *bufio.Scanner, out io.Writer, label, def string) string {
 		return def
 	}
 	return v
+}
+
+// readPassword reads a password from the user.
+//
+// When in is a terminal, the password is read without echo via
+// golang.org/x/term.ReadPassword. Otherwise (tests, piped input) it is
+// read as a plain line from sc, which shares the caller's scanner so a
+// mixed flag/prompt session reads its inputs in order.
+//
+// A password is never accepted as a command-line flag: it would leak
+// through the process listing and the shell history.
+func readPassword(sc *bufio.Scanner, in io.Reader, out io.Writer, label string) (string, error) {
+	fmt.Fprintf(out, "%s: ", label)
+	if f, ok := in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		pw, err := term.ReadPassword(int(f.Fd()))
+		fmt.Fprintln(out) // the user's Enter is suppressed; emit a newline
+		if err != nil {
+			return "", fmt.Errorf("client: read password: %w", err)
+		}
+		return string(pw), nil
+	}
+	if !sc.Scan() {
+		return "", errors.New("client: no password provided")
+	}
+	return strings.TrimSpace(sc.Text()), nil
 }

@@ -27,6 +27,11 @@ type Config struct {
 	EncryptionKey []byte
 	// TokenTTL is how long an issued JWT remains valid.
 	TokenTTL time.Duration
+	// TLSCertFile and TLSKeyFile are paths to a PEM-encoded certificate
+	// and private key. When both are empty the server generates a
+	// self-signed certificate in memory at startup.
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // Addr returns the "host:port" string suitable for http.Server.
@@ -51,6 +56,12 @@ func FromEnv() (*Config, error) {
 	cfg := &Config{
 		Host:       getenv("GOPHKEEPER_HOST", "127.0.0.1"),
 		StorageDSN: getenv("GOPHKEEPER_STORAGE_DSN", "gophkeeper.db"),
+	}
+
+	cfg.TLSCertFile = os.Getenv("GOPHKEEPER_TLS_CERT")
+	cfg.TLSKeyFile = os.Getenv("GOPHKEEPER_TLS_KEY")
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return nil, fmt.Errorf("config: GOPHKEEPER_TLS_CERT and GOPHKEEPER_TLS_KEY must be set together")
 	}
 
 	portStr := getenv("GOPHKEEPER_PORT", "8080")
@@ -82,8 +93,12 @@ func FromEnv() (*Config, error) {
 	return cfg, nil
 }
 
+// getenv returns the value of the environment variable named key, or
+// def if the variable is unset. An explicitly-empty value is returned
+// as-is — use os.LookupEnv semantics so that "GOPHKEEPER_PORT=" is not
+// silently replaced by the default.
 func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return def

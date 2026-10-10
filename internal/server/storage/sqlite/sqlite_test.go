@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -169,5 +170,115 @@ func seedUser(t *testing.T, s *Store, id string) {
 	})
 	if err != nil {
 		t.Fatalf("seed user: %v", err)
+	}
+}
+
+func TestCreateUserDuplicateViaConstraint(t *testing.T) {
+	// Duplicate detection is driven by the UNIQUE constraint, not by a
+	// pre-flight SELECT — this exercises the new code path.
+	s := newStore(t)
+	u := &models.User{ID: "u1", Username: "alice", Email: "a@x.io", CreatedAt: time.Now()}
+	if err := s.CreateUser(context.Background(), u); err != nil {
+		t.Fatalf("first CreateUser: %v", err)
+	}
+	u2 := &models.User{ID: "u2", Username: "alice", Email: "b@x.io", CreatedAt: time.Now()}
+	if err := s.CreateUser(context.Background(), u2); !errors.Is(err, storage.ErrDuplicate) {
+		t.Fatalf("want ErrDuplicate, got %v", err)
+	}
+}
+
+func TestSearchItemsMatchesMetadata(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s, "u1")
+	now := time.Now().UTC()
+	_, _ = s.UpsertItem(context.Background(), &models.Item{
+		ID: "i1", UserID: "u1", Type: models.ItemTypeText, Title: "github",
+		Metadata: "https://github.com", UpdatedAt: now,
+	})
+	_, _ = s.UpsertItem(context.Background(), &models.Item{
+		ID: "i2", UserID: "u1", Type: models.ItemTypeText, Title: "mail",
+		Metadata: "https://mail.example.com", UpdatedAt: now,
+	})
+
+	items, err := s.SearchItems(context.Background(), "u1", "github")
+	if err != nil {
+		t.Fatalf("SearchItems: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "i1" {
+		t.Fatalf("unexpected: %+v", items)
+	}
+}
+
+func TestSearchItemsCaseInsensitive(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s, "u1")
+	_, _ = s.UpsertItem(context.Background(), &models.Item{
+		ID: "i1", UserID: "u1", Type: models.ItemTypeText, Title: "t",
+		Metadata: "GitHub Account", UpdatedAt: time.Now().UTC(),
+	})
+	items, err := s.SearchItems(context.Background(), "u1", "github")
+	if err != nil {
+		t.Fatalf("SearchItems: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected case-insensitive match, got %+v", items)
+	}
+}
+
+func TestSearchItemsEscapesWildcards(t *testing.T) {
+	// A user-provided "%" must be matched literally, not as a LIKE wildcard.
+	s := newStore(t)
+	seedUser(t, s, "u1")
+	now := time.Now().UTC()
+	_, _ = s.UpsertItem(context.Background(), &models.Item{
+		ID: "literal", UserID: "u1", Type: models.ItemTypeText,
+		Title: "t1", Metadata: "100% discount", UpdatedAt: now,
+	})
+	_, _ = s.UpsertItem(context.Background(), &models.Item{
+		ID: "wild", UserID: "u1", Type: models.ItemTypeText,
+		Title: "t2", Metadata: "no-percent", UpdatedAt: now,
+	})
+
+	items, err := s.SearchItems(context.Background(), "u1", "%")
+	if err != nil {
+		t.Fatalf("SearchItems: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "literal" {
+		t.Fatalf("expected only literal match, got %+v", items)
+	}
+}
+
+func TestSearchItemsHidesDeleted(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s, "u1")
+	now := time.Now().UTC()
+	delAt := now
+	_, _ = s.UpsertItem(context.Background(), &models.Item{
+		ID: "i1", UserID: "u1", Type: models.ItemTypeText, Title: "t",
+		Metadata: "github", UpdatedAt: now, DeletedAt: &delAt,
+	})
+	items, err := s.SearchItems(context.Background(), "u1", "github")
+	if err != nil {
+		t.Fatalf("SearchItems: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("deleted items should not appear, got %+v", items)
+	}
+}
+
+func TestSearchItemsIsolatedByUser(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s, "u1")
+	seedUser(t, s, "u2")
+	_, _ = s.UpsertItem(context.Background(), &models.Item{
+		ID: "i1", UserID: "u2", Type: models.ItemTypeText, Title: "t",
+		Metadata: "shared-key", UpdatedAt: time.Now().UTC(),
+	})
+	items, err := s.SearchItems(context.Background(), "u1", "shared-key")
+	if err != nil {
+		t.Fatalf("SearchItems: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("search must not leak other users' items: %+v", items)
 	}
 }

@@ -7,10 +7,12 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"gophkeeper/internal/protocol"
@@ -24,9 +26,22 @@ type Client struct {
 
 // New returns a Client for the given base URL, e.g. "http://localhost:8080".
 // If hc is nil, a default client with a 30-second timeout is used.
+//
+// The default transport skips TLS certificate verification because the
+// GophKeeper server uses a self-signed certificate. For a production
+// deployment the caller should supply its own http.Client with a pinned
+// CA pool.
 func New(baseURL string, hc *http.Client) *Client {
 	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+		hc = &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					// #nosec G402 - self-signed dev certificate.
+					InsecureSkipVerify: true,
+				},
+			},
+		}
 	}
 	return &Client{baseURL: baseURL, http: hc}
 }
@@ -80,6 +95,18 @@ func (c *Client) Pull(ctx context.Context, token string, since time.Time) ([]pro
 func (c *Client) List(ctx context.Context, token string) ([]protocol.ItemDTO, error) {
 	var resp protocol.PushResponse
 	err := c.do(ctx, http.MethodGet, "/api/v1/items", token, nil, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Items, nil
+}
+
+// Search returns every live item owned by the authenticated user whose
+// metadata contains the given substring.
+func (c *Client) Search(ctx context.Context, token, query string) ([]protocol.ItemDTO, error) {
+	var resp protocol.PushResponse
+	path := "/api/v1/items?q=" + url.QueryEscape(query)
+	err := c.do(ctx, http.MethodGet, path, token, nil, &resp)
 	if err != nil {
 		return nil, err
 	}

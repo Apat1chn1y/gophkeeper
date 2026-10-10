@@ -108,3 +108,43 @@ func TestNetworkErrorIsWrapped(t *testing.T) {
 		t.Fatal("expected network error")
 	}
 }
+
+func TestSearchSendsQueryParameter(t *testing.T) {
+	seen := make(chan string, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/items", func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.Query().Get("q")
+		_ = json.NewEncoder(w).Encode(protocol.PushResponse{
+			Items: []protocol.ItemDTO{{ID: "i1", Title: "hit"}},
+		})
+	})
+	_, c := newServer(t, mux)
+
+	items, err := c.Search(context.Background(), "tok", "github account")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(items) != 1 || items[0].Title != "hit" {
+		t.Fatalf("unexpected: %+v", items)
+	}
+	if got := <-seen; got != "github account" {
+		t.Fatalf("q = %q, want %q", got, "github account")
+	}
+}
+
+func TestListUsesDefaultTransport(t *testing.T) {
+	// Sanity check that a client created with a nil http.Client still
+	// talks to a plain httptest server. (TLS-specific behaviour lives in
+	// the server/app tests.)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/items", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(protocol.PushResponse{})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, nil)
+	if _, err := c.List(context.Background(), "tok"); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+}

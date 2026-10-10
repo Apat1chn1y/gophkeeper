@@ -46,6 +46,10 @@ type Repository interface {
 	// ListItems returns all non-deleted items belonging to userID.
 	ListItems(ctx context.Context, userID string) ([]models.Item, error)
 
+	// SearchItems returns non-deleted items of userID whose metadata
+	// contains the given substring (case-insensitive for ASCII).
+	SearchItems(ctx context.Context, userID, query string) ([]models.Item, error)
+
 	// ItemsSince returns all items (including soft-deleted ones) whose
 	// UpdatedAt is strictly after since. Used by the sync pull endpoint.
 	ItemsSince(ctx context.Context, userID string, since time.Time) ([]models.Item, error)

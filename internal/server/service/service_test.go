@@ -228,7 +228,7 @@ func TestDeletePropagatesThroughPull(t *testing.T) {
 		{ID: "i1", Type: string(models.ItemTypeText), Title: "a",
 			Data: []byte("x"), UpdatedAt: before.Add(time.Second)},
 	})
-	time.Sleep(2 * time.Millisecond)
+
 	if err := s.Delete(ctx, uid, "i1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -251,5 +251,47 @@ func TestGetItemNotFound(t *testing.T) {
 	_, err := s.GetItem(context.Background(), uid, "nope")
 	if !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestServiceSearchItems(t *testing.T) {
+	s := newService(t)
+	ctx := context.Background()
+	uid, _ := s.Register(ctx, "alice", "a@x.io", "pw")
+	now := time.Now().UTC()
+
+	_, _ = s.Push(ctx, uid, []protocol.ItemDTO{
+		{ID: "i1", Type: string(models.ItemTypeText), Title: "gh",
+			Metadata: "github account", Data: []byte("x"), UpdatedAt: now},
+		{ID: "i2", Type: string(models.ItemTypeText), Title: "other",
+			Metadata: "example.com", Data: []byte("y"), UpdatedAt: now},
+	})
+
+	got, err := s.SearchItems(ctx, uid, "github")
+	if err != nil {
+		t.Fatalf("SearchItems: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "i1" {
+		t.Fatalf("unexpected: %+v", got)
+	}
+	// The payload must round-trip through encryption+decryption.
+	if string(got[0].Data) != "x" {
+		t.Fatalf("data corrupted: %q", got[0].Data)
+	}
+}
+
+func TestServiceSearchItemsEmptyQueryFallsBackToList(t *testing.T) {
+	s := newService(t)
+	ctx := context.Background()
+	uid, _ := s.Register(ctx, "alice", "a@x.io", "pw")
+	_, _ = s.Push(ctx, uid, []protocol.ItemDTO{
+		{ID: "i1", Type: string(models.ItemTypeText), Title: "a", UpdatedAt: time.Now()},
+	})
+	got, err := s.SearchItems(ctx, uid, "")
+	if err != nil {
+		t.Fatalf("SearchItems: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("empty query should fall back to ListItems, got %+v", got)
 	}
 }
