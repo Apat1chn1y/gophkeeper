@@ -370,8 +370,7 @@ func TestAddFromFileMissing(t *testing.T) {
 // TestListSearchQueriesServer verifies that -search hits GET /api/v1/items?q=...
 func TestListSearchQueriesServer(t *testing.T) {
 	isolatePaths(t)
-	dir, _ := seedConfig(t)
-	_ = dir
+	_, _ = seedConfig(t)
 
 	// Stand up a fake server that answers the search endpoint.
 	seenQuery := make(chan string, 1)

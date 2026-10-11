@@ -10,9 +10,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"math/big"
@@ -40,8 +42,14 @@ const shutdownTimeout = 10 * time.Second
 // The server always terminates TLS. If cfg.TLSCertFile and
 // cfg.TLSKeyFile are set, the PEM pair is loaded from disk; otherwise a
 // self-signed certificate for 127.0.0.1/localhost is generated in memory
-// at startup. The certificate's SHA-256 fingerprint is logged so that a
-// client can pin it if it chooses.
+// at startup.
+//
+// In both cases the SHA-256 fingerprint of the leaf certificate is logged
+// at startup, so a client can pin the server's identity by comparing the
+// fingerprint out of band instead of disabling verification. The log line
+// also reports whether the certificate was loaded from a file ("file") or
+// generated on this run ("self-signed"): the latter changes on every
+// restart.
 //
 // It returns nil on a clean shutdown and a non-nil error on any other
 // failure. If logger is nil, slog.Default() is used.
@@ -65,6 +73,15 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+
+	// Log the certificate fingerprint so a client can pin the server's
+	// identity by SHA-256 instead of skipping verification. The value is
+	// computed over the DER-encoded leaf certificate — the same one that
+	// `openssl x509 -fingerprint -sha256` prints, only without colons.
+	fp := sha256.Sum256(cert.Certificate[0])
+	logger.Info("tls certificate ready",
+		"sha256", hex.EncodeToString(fp[:]),
+		"source", certSource(cfg))
 
 	svc := service.New(store, enc, cfg.JWTSecret, cfg.TokenTTL)
 	handler := api.New(svc, cfg.JWTSecret, logger).Routes()
@@ -121,6 +138,18 @@ func loadOrGenerateCert(cfg *config.Config) (tls.Certificate, error) {
 		return cert, nil
 	}
 	return selfSignedCert()
+}
+
+// certSource reports where the server's TLS certificate came from. It is
+// used only in log lines, to make the fingerprint easier to interpret:
+// "self-signed" means the value was generated on this run and will change
+// on the next start; "file" means it was loaded from cfg.TLSCertFile and
+// is therefore stable across restarts.
+func certSource(cfg *config.Config) string {
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		return "file"
+	}
+	return "self-signed"
 }
 
 // selfSignedCert returns an in-memory self-signed certificate for

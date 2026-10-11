@@ -98,15 +98,20 @@ func (s *Store) CreateUser(ctx context.Context, u *models.User) error {
 }
 
 // isUniqueViolation reports whether err is a SQLite UNIQUE-constraint
-// violation. It prefers the structured error code exposed by the driver
-// and falls back to the driver's message text for robustness.
+// violation.
+//
+// The driver exposes SQLite's extended error codes through Code(), so
+// the check targets SQLITE_CONSTRAINT_UNIQUE (2067) specifically rather
+// than the primary SQLITE_CONSTRAINT (19), which also covers NOT NULL,
+// FOREIGN KEY, CHECK and PRIMARY KEY failures. The string fallback below
+// covers drivers or wrappers that do not surface extended codes.
 func isUniqueViolation(err error) bool {
-	const sqliteConstraint = 19 // SQLITE_CONSTRAINT
+	const (
+		sqliteConstraintUnique = 2067 // SQLITE_CONSTRAINT_UNIQUE (extended)
+	)
 	var coder interface{ Code() int }
-	if errors.As(err, &coder) {
-		if coder.Code()&0xff == sqliteConstraint {
-			return true
-		}
+	if errors.As(err, &coder) && coder.Code() == sqliteConstraintUnique {
+		return true
 	}
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
